@@ -447,7 +447,7 @@ class Worker:
                 await pipe.watch(in_progress_key)
                 ongoing_exists = await pipe.exists(in_progress_key)
                 score = await pipe.zscore(self.queue_name, job_id)
-                if ongoing_exists or not score:
+                if ongoing_exists or not score or score > timestamp_ms():
                     # job already started elsewhere, or already finished and removed from queue
                     self.job_counter = self.job_counter - 1
                     self.sem.release()
