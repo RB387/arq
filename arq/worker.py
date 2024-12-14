@@ -233,6 +233,7 @@ class Worker:
         timezone: Optional[timezone] = None,
         log_results: bool = True,
         max_consumer_inactivity: 'SecondsTimedelta' = 86400,
+        idle_consumer_poll_interval: 'SecondsTimedelta' = 60,
     ):
         self.functions: Dict[str, Union[Function, CronJob]] = {f.name: f for f in map(func, functions)}
         if queue_name is None:
@@ -314,7 +315,7 @@ class Worker:
         self.expires_extra_ms = expires_extra_ms
         self.log_results = log_results
         self.max_consumer_inactivity = max_consumer_inactivity
-        self.dlq_job_poller_task: asyncio.Task[None] = None
+        self.idle_consumer_poll_interval = idle_consumer_poll_interval
 
         # default to system timezone
         self.timezone = datetime.now().astimezone().tzinfo if timezone is None else timezone
@@ -379,10 +380,11 @@ class Worker:
 
         await self.create_consumer_group()
 
-        _, pending = await asyncio.wait(
+        done, pending = await asyncio.wait(
             [
                 asyncio.ensure_future(self.run_delayed_queue_poller()),
                 asyncio.ensure_future(self.run_stream_reader()),
+                asyncio.ensure_future(self.run_idle_consumer_cleanup()),
             ],
             return_when=asyncio.FIRST_COMPLETED,
         )
@@ -391,6 +393,9 @@ class Worker:
             task.cancel()
 
         await asyncio.gather(*pending, return_exceptions=True)
+
+        for task in done:
+            task.result()
 
     async def run_stream_reader(self) -> None:
         while True:
@@ -431,6 +436,27 @@ class Worker:
                     ],
                     args=[job_id.decode(), expire_ms],
                 )
+
+    async def run_idle_consumer_cleanup(self) -> None:
+        async for _ in poll(self.idle_consumer_poll_interval):
+            consumers_info = await self.pool.xinfo_consumers(
+                self.queue_name + stream_key_suffix,
+                groupname=self.consumer_group_name,
+            )
+
+            for consumer_info in consumers_info:
+                if self.worker_id == consumer_info['name'].decode():
+                    continue
+
+                idle = timedelta(milliseconds=consumer_info['idle']).seconds
+                pending = consumer_info['pending']
+
+                if pending == 0 and idle > self.max_consumer_inactivity:
+                    await self.pool.xgroup_delconsumer(
+                        name=self.queue_name + stream_key_suffix,
+                        groupname=self.consumer_group_name,
+                        consumername=consumer_info['name'],
+                    )
 
     async def create_consumer_group(self) -> None:
         with suppress(ResponseError):
