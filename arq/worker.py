@@ -64,7 +64,7 @@ class Function:
 
 
 @dataclass
-class StreamMessage:
+class JobMetaInfo:
     message_id: str
     job_id: str
     score: int
@@ -314,6 +314,7 @@ class Worker:
         self.expires_extra_ms = expires_extra_ms
         self.log_results = log_results
         self.max_consumer_inactivity = max_consumer_inactivity
+        self.dlq_job_poller_task: asyncio.Task[None] = None
 
         # default to system timezone
         self.timezone = datetime.now().astimezone().tzinfo if timezone is None else timezone
@@ -378,16 +379,18 @@ class Worker:
 
         await self.create_consumer_group()
 
-        self.poller_task = asyncio.create_task(self.run_delayed_queue_poller())
+        _, pending = await asyncio.wait(
+            [
+                asyncio.ensure_future(self.run_delayed_queue_poller()),
+                asyncio.ensure_future(self.run_stream_reader()),
+            ],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
 
-        try:
-            await self.run_stream_reader()
-        finally:
-            self.poller_task.cancel()
-            await asyncio.gather(
-                self.poller_task,
-                return_exceptions=True,
-            )
+        for task in pending:
+            task.cancel()
+
+        await asyncio.gather(*pending, return_exceptions=True)
 
     async def run_stream_reader(self) -> None:
         while True:
@@ -467,8 +470,10 @@ class Worker:
                 for _, msgs in stream_msgs:
                     for msg_id, job in msgs:
                         jobs.append(
-                            StreamMessage(
-                                message_id=msg_id.decode(), job_id=job[b'job_id'].decode(), score=int(job[b'score'])
+                            JobMetaInfo(
+                                message_id=msg_id.decode(),
+                                job_id=job[b'job_id'].decode(),
+                                score=int(job[b'score']),
                             )
                         )
 
@@ -504,7 +509,6 @@ class Worker:
         # cast to the same format as the xreadgroup response
         return [((self.queue_name + stream_key_suffix).encode(), msgs)]
 
-
     async def _cancel_aborted_jobs(self) -> None:
         """
         Go through job_ids in the abort_jobs_ss sorted set and cancel those tasks.
@@ -533,7 +537,7 @@ class Worker:
         self.job_counter = self.job_counter - 1
         self.sem.release()
 
-    async def start_jobs(self, jobs: list[StreamMessage]) -> None:
+    async def start_jobs(self, jobs: list[JobMetaInfo]) -> None:
         """
         For each job id, get the job definition, check it's not running and start it in a task
         """
@@ -555,7 +559,7 @@ class Worker:
                 ongoing_exists = await pipe.exists(in_progress_key)
 
                 if ongoing_exists:
-                    await self._redeliver_job(job)
+                    await self._unclaim_job(job)
                     self.job_counter = self.job_counter - 1
                     self.sem.release()
                     logger.debug('job %s already running elsewhere', job_id)
@@ -575,7 +579,7 @@ class Worker:
                     t.add_done_callback(lambda _: self._release_sem_dec_counter_on_complete())
                     self.tasks[job_id] = t
 
-    async def _redeliver_job(self, job: StreamMessage) -> None:
+    async def _unclaim_job(self, job: JobMetaInfo) -> None:
         async with self.pool.pipeline(transaction=True) as pipe:
             stream_key = self.queue_name + stream_key_suffix
             job_message_id_key = job_message_id_prefix + job.job_id
@@ -873,9 +877,6 @@ class Worker:
             await tr.execute()
 
     async def heart_beat(self) -> None:
-        if self.poller_task.done():
-            raise self.poller_task.exception()
-
         now = datetime.now(tz=self.timezone)
         await self.record_health()
 
