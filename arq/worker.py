@@ -232,6 +232,7 @@ class Worker:
         expires_extra_ms: int = expires_extra_ms,
         timezone: Optional[timezone] = None,
         log_results: bool = True,
+        max_consumer_inactivity: 'SecondsTimedelta' = 86400,
     ):
         self.functions: Dict[str, Union[Function, CronJob]] = {f.name: f for f in map(func, functions)}
         if queue_name is None:
@@ -312,6 +313,7 @@ class Worker:
         self.job_deserializer = job_deserializer
         self.expires_extra_ms = expires_extra_ms
         self.log_results = log_results
+        self.max_consumer_inactivity = max_consumer_inactivity
 
         # default to system timezone
         self.timezone = datetime.now().astimezone().tzinfo if timezone is None else timezone
@@ -377,16 +379,13 @@ class Worker:
         await self.create_consumer_group()
 
         self.poller_task = asyncio.create_task(self.run_delayed_queue_poller())
-        self.autoclaimer_task = asyncio.create_task(self.run_dead_task_autoclaimer())
 
         try:
             await self.run_stream_reader()
         finally:
             self.poller_task.cancel()
-            self.autoclaimer_task.cancel()
             await asyncio.gather(
                 self.poller_task,
-                self.autoclaimer_task,
                 return_exceptions=True,
             )
 
@@ -402,20 +401,6 @@ class Worker:
                 if queued_jobs == 0:
                     await asyncio.gather(*self.tasks.values())
                     return None
-
-    async def run_dead_task_autoclaimer(self) -> None:
-        async for _ in poll(self.poll_delay_s):
-            consumers_info = await self.pool.xinfo_consumers(
-                self.queue_name + stream_key_suffix,
-                groupname=self.consumer_group_name,
-            )
-            for consumer_info in consumers_info:
-                await self.pool.xautoclaim(
-                    self.queue_name + stream_key_suffix,
-                    groupname=self.consumer_group_name,
-                    consumername=consumer_info['name'],
-                    min_idle_time=int(self.in_progress_timeout_s * 1000),
-                )
 
     async def run_delayed_queue_poller(self) -> None:
         publish_delayed_job = self.pool.register_script(publish_delayed_job_lua)
@@ -466,13 +451,17 @@ class Worker:
             count = min(burst_jobs_remaining, count)
         if self.allow_pick_jobs:
             if self.job_counter < self.max_jobs:
-                stream_msgs = await self.pool.xreadgroup(
-                    groupname=self.consumer_group_name,
-                    consumername=self.worker_id,
-                    streams={self.queue_name + stream_key_suffix: '>'},
-                    count=count,
-                    block=int(max(self.poll_delay_s * 1000, 1)),
-                )
+                stream_msgs = await self._get_idle_tasks(count)
+
+                if not stream_msgs:
+                    stream_msgs = await self.pool.xreadgroup(
+                        groupname=self.consumer_group_name,
+                        consumername=self.worker_id,
+                        streams={self.queue_name + stream_key_suffix: '>'},
+                        count=count,
+                        block=int(max(self.poll_delay_s * 1000, 1)),
+                    )
+
                 jobs = []
 
                 for _, msgs in stream_msgs:
@@ -495,6 +484,26 @@ class Worker:
                 t.result()
 
         await self.heart_beat()
+
+    async def _get_idle_tasks(self, count: int) -> list[tuple[bytes, list]]:
+        resp = await self.pool.xautoclaim(
+            self.queue_name + stream_key_suffix,
+            groupname=self.consumer_group_name,
+            consumername=self.worker_id,
+            min_idle_time=self.in_progress_timeout_s * 1000,
+            count=count,
+        )
+
+        if not resp:
+            return []
+
+        _, msgs, __ = resp
+        if not msgs:
+            return []
+
+        # cast to the same format as the xreadgroup response
+        return [((self.queue_name + stream_key_suffix).encode(), msgs)]
+
 
     async def _cancel_aborted_jobs(self) -> None:
         """
