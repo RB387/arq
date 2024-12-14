@@ -490,7 +490,7 @@ class Worker:
             self.queue_name + stream_key_suffix,
             groupname=self.consumer_group_name,
             consumername=self.worker_id,
-            min_idle_time=self.in_progress_timeout_s * 1000,
+            min_idle_time=int(self.in_progress_timeout_s * 1000),
             count=count,
         )
 
