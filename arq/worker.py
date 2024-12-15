@@ -488,15 +488,19 @@ class Worker:
         if self.allow_pick_jobs:
             if self.job_counter < self.max_jobs:
                 stream_msgs = await self._get_idle_tasks(count)
-                count = count - len(stream_msgs)
+                msgs_count = sum([len(msgs) for _, msgs in stream_msgs])
+
+                count -= msgs_count
 
                 if count > 0:
-                    stream_msgs = await self.pool.xreadgroup(
-                        groupname=self.consumer_group_name,
-                        consumername=self.worker_id,
-                        streams={self.queue_name + stream_key_suffix: '>'},
-                        count=count,
-                        block=int(max(self.stream_block_s * 1000, 1)),
+                    stream_msgs.extend(
+                        await self.pool.xreadgroup(
+                            groupname=self.consumer_group_name,
+                            consumername=self.worker_id,
+                            streams={self.queue_name + stream_key_suffix: '>'},
+                            count=count,
+                            block=int(max(self.stream_block_s * 1000, 1)),
+                        )
                     )
 
                 jobs = []
