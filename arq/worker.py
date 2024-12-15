@@ -425,19 +425,23 @@ class Worker:
                 withscores=True,
                 byscore=True,
             )
-            for job_id, score in job_ids:
-                expire_ms = int(score - timestamp_ms() + self.expires_extra_ms)
-                if expire_ms <= 0:
-                    expire_ms = self.expires_extra_ms
+            async with self.pool.pipeline(transaction=False) as pipe:
+                for job_id, score in job_ids:
+                    expire_ms = int(score - timestamp_ms() + self.expires_extra_ms)
+                    if expire_ms <= 0:
+                        expire_ms = self.expires_extra_ms
 
-                await publish_delayed_job(
-                    keys=[
-                        self.queue_name,
-                        self.queue_name + stream_key_suffix,
-                        job_message_id_prefix + job_id.decode(),
-                    ],
-                    args=[job_id.decode(), expire_ms],
-                )
+                    await publish_delayed_job(
+                        keys=[
+                            self.queue_name,
+                            self.queue_name + stream_key_suffix,
+                            job_message_id_prefix + job_id.decode(),
+                        ],
+                        args=[job_id.decode(), expire_ms],
+                        client=pipe,
+                    )
+
+                await pipe.execute()
 
     async def run_idle_consumer_cleanup(self) -> None:
         async for _ in poll(self.idle_consumer_poll_interval_s):
