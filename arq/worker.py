@@ -219,6 +219,7 @@ class Worker:
         keep_result: 'SecondsTimedelta' = 3600,
         keep_result_forever: bool = False,
         poll_delay: 'SecondsTimedelta' = 0.5,
+        stream_block: 'SecondsTimedelta' = 0.5,
         queue_read_limit: Optional[int] = None,
         max_tries: int = 5,
         health_check_interval: 'SecondsTimedelta' = 3600,
@@ -267,6 +268,9 @@ class Worker:
         self.keep_result_s = to_seconds(keep_result)
         self.keep_result_forever = keep_result_forever
         self.poll_delay_s = to_seconds(poll_delay)
+        self.stream_block_s = to_seconds(stream_block)
+        self.max_consumer_inactivity_s = to_seconds(max_consumer_inactivity)
+        self.idle_consumer_poll_interval_s = to_seconds(idle_consumer_poll_interval)
         self.queue_read_limit = queue_read_limit or max(max_jobs * 5, 100)
         self._queue_read_offset = 0
         self.max_tries = max_tries
@@ -314,8 +318,6 @@ class Worker:
         self.job_deserializer = job_deserializer
         self.expires_extra_ms = expires_extra_ms
         self.log_results = log_results
-        self.max_consumer_inactivity = max_consumer_inactivity
-        self.idle_consumer_poll_interval = idle_consumer_poll_interval
 
         # default to system timezone
         self.timezone = datetime.now().astimezone().tzinfo if timezone is None else timezone
@@ -399,7 +401,7 @@ class Worker:
 
     async def run_stream_reader(self) -> None:
         while True:
-            await self._poll_iteration()
+            await self._read_stream_iteration()
 
             if self.burst:
                 if 0 <= self.max_burst_jobs <= self._jobs_started():
@@ -438,7 +440,7 @@ class Worker:
                 )
 
     async def run_idle_consumer_cleanup(self) -> None:
-        async for _ in poll(self.idle_consumer_poll_interval):
+        async for _ in poll(self.idle_consumer_poll_interval_s):
             consumers_info = await self.pool.xinfo_consumers(
                 self.queue_name + stream_key_suffix,
                 groupname=self.consumer_group_name,
@@ -451,7 +453,7 @@ class Worker:
                 idle = timedelta(milliseconds=consumer_info['idle']).seconds
                 pending = consumer_info['pending']
 
-                if pending == 0 and idle > self.max_consumer_inactivity:
+                if pending == 0 and idle > self.max_consumer_inactivity_s:
                     await self.pool.xgroup_delconsumer(
                         name=self.queue_name + stream_key_suffix,
                         groupname=self.consumer_group_name,
@@ -467,7 +469,7 @@ class Worker:
                 mkstream=True,
             )
 
-    async def _poll_iteration(self) -> None:
+    async def _read_stream_iteration(self) -> None:
         """
         Get ids of pending jobs from the main queue sorted-set data structure and start those jobs, remove
         any finished tasks from self.tasks.
@@ -481,14 +483,15 @@ class Worker:
         if self.allow_pick_jobs:
             if self.job_counter < self.max_jobs:
                 stream_msgs = await self._get_idle_tasks(count)
+                count = count - len(stream_msgs)
 
-                if not stream_msgs:
+                if count > 0:
                     stream_msgs = await self.pool.xreadgroup(
                         groupname=self.consumer_group_name,
                         consumername=self.worker_id,
                         streams={self.queue_name + stream_key_suffix: '>'},
                         count=count,
-                        block=int(max(self.poll_delay_s * 1000, 1)),
+                        block=int(max(self.stream_block_s * 1000, 1)),
                     )
 
                 jobs = []

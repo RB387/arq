@@ -621,14 +621,14 @@ async def test_queue_read_limit_equals_max_jobs(arq_redis: ArqRedis, worker):
     assert worker.jobs_retried == 0
 
     await worker.create_consumer_group()
-    await worker._poll_iteration()
+    await worker._read_stream_iteration()
     await asyncio.sleep(0.1)
     assert await arq_redis.get_queue_size(default_queue_name) == 2
     assert worker.jobs_complete == 2
     assert worker.jobs_failed == 0
     assert worker.jobs_retried == 0
 
-    await worker._poll_iteration()
+    await worker._read_stream_iteration()
     await asyncio.sleep(0.1)
     assert await arq_redis.get_queue_size(default_queue_name) == 0
     assert worker.jobs_complete == 4
@@ -654,14 +654,14 @@ async def test_custom_queue_read_limit(arq_redis: ArqRedis, worker):
     assert worker.jobs_retried == 0
 
     await worker.create_consumer_group()
-    await worker._poll_iteration()
+    await worker._read_stream_iteration()
     await asyncio.sleep(0.1)
     assert await arq_redis.get_queue_size(default_queue_name) == 2
     assert worker.jobs_complete == 2
     assert worker.jobs_failed == 0
     assert worker.jobs_retried == 0
 
-    await worker._poll_iteration()
+    await worker._read_stream_iteration()
     await asyncio.sleep(0.1)
     assert await arq_redis.zcard(default_queue_name) == 0
     assert worker.jobs_complete == 4
@@ -785,7 +785,7 @@ async def test_max_bursts_dont_get(arq_redis: ArqRedis, worker):
 
     worker.max_burst_jobs = 0
     assert len(worker.tasks) == 0
-    await worker._poll_iteration()
+    await worker._read_stream_iteration()
     assert len(worker.tasks) == 0
 
 
@@ -1062,7 +1062,7 @@ async def test_worker_retry(mocker, worker_retry, exception_thrown):
 
     # baseline
     await worker.main()
-    await worker._poll_iteration()
+    await worker._read_stream_iteration()
 
     # spy method handling call_with_retry failure
     spy = mocker.spy(worker.pool, '_disconnect_raise')
@@ -1073,7 +1073,7 @@ async def test_worker_retry(mocker, worker_retry, exception_thrown):
 
         # assert exception thrown
         with pytest.raises(type(exception_thrown)):
-            await worker._poll_iteration()
+            await worker._read_stream_iteration()
 
         # assert retry counts and no exception thrown during '_disconnect_raise'
         assert spy.call_count == 4  # retries setting + 1
@@ -1100,7 +1100,7 @@ async def test_worker_crash(mocker, worker, exception_thrown):
 
     # baseline
     await worker.main()
-    await worker._poll_iteration()
+    await worker._read_stream_iteration()
 
     # spy method handling call_with_retry failure
     spy = mocker.spy(worker.pool, '_disconnect_raise')
@@ -1111,7 +1111,7 @@ async def test_worker_crash(mocker, worker, exception_thrown):
 
         # assert exception thrown
         with pytest.raises(type(exception_thrown)):
-            await worker._poll_iteration()
+            await worker._read_stream_iteration()
 
         # assert no retry counts and exception thrown during '_disconnect_raise'
         assert spy.call_count == 1
