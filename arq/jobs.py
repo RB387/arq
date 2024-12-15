@@ -82,7 +82,7 @@ class Job:
     Holds data a reference to a job.
     """
 
-    __slots__ = 'job_id', '_redis', '_queue_name', '_deserializer', '_get_job_from_stream_script'
+    __slots__ = 'job_id', '_redis', '_queue_name', '_deserializer'
 
     def __init__(
         self,
@@ -95,7 +95,6 @@ class Job:
         self._redis = redis
         self._queue_name = _queue_name
         self._deserializer = _deserializer
-        self._get_job_from_stream_script = redis.register_script(get_job_from_stream_lua)
 
     async def result(
         self, timeout: Optional[float] = None, *, poll_delay: float = 0.5, pole_delay: Optional[float] = None
@@ -152,9 +151,11 @@ class Job:
         if info:
             async with self._redis.pipeline(transaction=True) as tr:
                 tr.zscore(self._queue_name, self.job_id)
-                await self._get_job_from_stream_script(
-                    keys=[self._queue_name + stream_key_suffix, job_message_id_prefix + self.job_id],
-                    client=tr,
+                tr.eval(
+                    get_job_from_stream_lua,
+                    2,
+                    self._queue_name + stream_key_suffix,
+                    job_message_id_prefix + self.job_id,
                 )
                 delayed_score, job_info = await tr.execute()
 

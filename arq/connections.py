@@ -123,7 +123,6 @@ class ArqRedis(BaseRedis):
             kwargs['connection_pool'] = pool_or_conn
         self.expires_extra_ms = expires_extra_ms
         super().__init__(**kwargs)
-        self.publish_to_stream_script = self.register_script(publish_job_lua)
 
     async def enqueue_job(
         self,
@@ -194,10 +193,16 @@ class ArqRedis(BaseRedis):
             else:
                 stream_key = _queue_name + stream_key_suffix
                 job_message_id_key = job_message_id_prefix + job_id
-                await self.publish_to_stream_script(
-                    keys=[stream_key, job_message_id_key],
-                    args=[job_id, str(enqueue_time_ms), str(expires_ms)],
-                    client=pipe,
+                pipe.eval(
+                    publish_job_lua,
+                    2,
+                    # keys
+                    stream_key,
+                    job_message_id_key,
+                    # args
+                    job_id,
+                    str(enqueue_time_ms),
+                    str(expires_ms),
                 )
 
             try:

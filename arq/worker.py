@@ -12,6 +12,7 @@ from time import time
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union, cast
 from uuid import uuid4
 
+from redis.asyncio.client import Pipeline
 from redis.exceptions import ResponseError, WatchError
 
 from arq.cron import CronJob
@@ -33,7 +34,7 @@ from .constants import (
     retry_key_prefix,
     stream_key_suffix,
 )
-from .lua import publish_delayed_job_lua
+from .lua import publish_delayed_job_lua, publish_job_lua
 from .utils import (
     args_to_string,
     import_string,
@@ -592,7 +593,9 @@ class Worker:
                 ongoing_exists = await pipe.exists(in_progress_key)
 
                 if ongoing_exists:
-                    await self._unclaim_job(job)
+                    await pipe.unwatch()
+                    await self._unclaim_job(job, pipe)
+                    await pipe.execute()
                     self.job_counter = self.job_counter - 1
                     self.sem.release()
                     logger.debug('job %s already running elsewhere', job_id)
@@ -604,6 +607,9 @@ class Worker:
                     await pipe.execute()
                 except (ResponseError, WatchError):
                     # job already started elsewhere since we got 'existing'
+                    pipe.multi()
+                    await self._unclaim_job(job, pipe)
+                    await pipe.execute()
                     self.job_counter = self.job_counter - 1
                     self.sem.release()
                     logger.debug('multi-exec error, job %s already started elsewhere', job_id)
@@ -612,24 +618,27 @@ class Worker:
                     t.add_done_callback(lambda _: self._release_sem_dec_counter_on_complete())
                     self.tasks[job_id] = t
 
-    async def _unclaim_job(self, job: JobMetaInfo) -> None:
-        async with self.pool.pipeline(transaction=True) as pipe:
-            stream_key = self.queue_name + stream_key_suffix
-            job_message_id_key = job_message_id_prefix + job.job_id
+    async def _unclaim_job(self, job: JobMetaInfo, pipe: Pipeline) -> None:
+        stream_key = self.queue_name + stream_key_suffix
+        job_message_id_key = job_message_id_prefix + job.job_id
 
-            pipe.xack(stream_key, self.consumer_group_name, job.message_id)
-            pipe.xdel(stream_key, job.message_id)
-            job_message_id_expire = job.score - timestamp_ms() + self.expires_extra_ms
-            if job_message_id_expire <= 0:
-                job_message_id_expire = self.expires_extra_ms
+        pipe.xack(stream_key, self.consumer_group_name, job.message_id)
+        pipe.xdel(stream_key, job.message_id)
+        job_message_id_expire = job.score - timestamp_ms() + self.expires_extra_ms
+        if job_message_id_expire <= 0:
+            job_message_id_expire = self.expires_extra_ms
 
-            await self.pool.publish_to_stream_script(
-                keys=[stream_key, job_message_id_key],
-                args=[job.job_id, str(job.score), str(job_message_id_expire)],
-                client=pipe,
-            )
-
-            await pipe.execute()
+        pipe.eval(
+            publish_job_lua,
+            2,
+            # keys
+            stream_key,
+            job_message_id_key,
+            # args
+            job.job_id,
+            str(job.score),
+            str(job_message_id_expire),
+        )
 
     async def run_job(self, job_id: str, message_id: str, score: int) -> None:  # noqa: C901
         start_ms = timestamp_ms()
@@ -877,10 +886,16 @@ class Worker:
                 tr.zadd(self.queue_name, {job_id: score + incr_score})
             else:
                 job_message_id_expire = score - timestamp_ms() + self.expires_extra_ms
-                await self.pool.publish_to_stream_script(
-                    keys=[stream_key, job_message_id_key],
-                    args=[job_id, str(score), str(job_message_id_expire)],
-                    client=tr,
+                tr.eval(
+                    publish_job_lua,
+                    2,
+                    # keys
+                    stream_key,
+                    job_message_id_key,
+                    # args
+                    job_id,
+                    str(score),
+                    str(job_message_id_expire),
                 )
             if delete_keys:
                 tr.delete(*delete_keys)
