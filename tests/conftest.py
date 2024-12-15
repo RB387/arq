@@ -111,7 +111,7 @@ async def worker(arq_redis):
             poll_delay=poll_delay,
             max_jobs=max_jobs,
             stream_block=stream_block,
-            **kwargs
+            **kwargs,
         )
         return worker_
 
