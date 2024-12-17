@@ -5,7 +5,6 @@ import warnings
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from itertools import batched
 from typing import Any, Callable, Dict, Optional, Tuple
 
 from redis.asyncio import Redis
@@ -74,7 +73,7 @@ class JobResult(JobDef):
 
 
 def _list_to_dict(input_list: list[Any]) -> dict[Any, Any]:
-    return {key: value for key, value in batched(input_list, 2)}
+    return dict(zip(input_list[::2], input_list[1::2], strict=True))
 
 
 class Job:
